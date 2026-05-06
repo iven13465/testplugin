@@ -14,7 +14,7 @@ from astrbot.api.message_components import Image, Plain
 class MemeReaderPro(Star):
     def __init__(self, context: Context):
         super().__init__(context)
-        # 配置文件路径，现在只负责保存用户设定的帧数
+        # 配置文件路径，负责保存用户设定的帧数
         self.config_path = os.path.join(os.path.dirname(__file__), "meme_config.json")
         self.config = {
             "max_frames": 4  # GIF 默认最大提取帧数
@@ -62,10 +62,11 @@ class MemeReaderPro(Star):
     @filter.command("解读")
     async def read_meme(self, event: AstrMessageEvent):
         """发送 /解读 并附带图片/动图"""
-        img_url_or_path = None
+        img_url_or_path = ""
         for component in event.get_messages():
             if isinstance(component, Image):
-                img_url_or_path = component.url or component.file 
+                # 【关键修复】确保提取出的是纯文本格式的路径或 URL，并且转为字符串
+                img_url_or_path = str(component.url or component.file)
                 break
 
         if not img_url_or_path:
@@ -76,27 +77,29 @@ class MemeReaderPro(Star):
 
         temp_files_to_clean = []
         try:
-            # 【符合官方文档规范】直接获取系统当前正在使用的提供商
+            # 获取系统当前正在使用的提供商
             provider = self.context.get_using_provider()
             if provider is None:
                 yield event.plain_result("❌ 错误：AstrBot 当前未配置可用的大模型提供商。")
                 return
 
             # 判断并处理 GIF 动图
-            image_urls = []
+            final_image_urls = []
             is_gif = img_url_or_path.lower().endswith('.gif') or "gif" in img_url_or_path.lower()
             
             if is_gif:
                 yield event.plain_result(f"🎞️ 检测到动图，正在均匀提取 {self.config['max_frames']} 帧关键画面...")
+                # process_gif 抽取后返回的本身就是字符串路径的列表
                 frames, temp_files_to_clean = await self.process_gif(img_url_or_path, self.config["max_frames"])
-                image_urls = frames
+                final_image_urls = frames 
             else:
-                image_urls = [img_url_or_path]
+                # 【关键修复】如果是单张图片，必须用列表 [ ] 包裹起来传给底层
+                final_image_urls = [img_url_or_path]
 
             # 构建提示词
             prompt = "你是一个精通互联网黑话和梗图的冲浪高手。"
             if is_gif:
-                prompt += f"用户提供了一个 GIF 动图的 {len(image_urls)} 帧连续截图。请根据这几张图的时间顺序：\n"
+                prompt += f"用户提供了一个 GIF 动图的 {len(final_image_urls)} 帧连续截图。请根据这几张图的时间顺序：\n"
             else:
                 prompt += "请观察用户提供的这张表情包：\n"
                 
@@ -109,7 +112,7 @@ class MemeReaderPro(Star):
             response = await provider.text_chat(
                 prompt=prompt,
                 session_id=event.session_id, 
-                image_urls=image_urls         
+                image_urls=final_image_urls  # 此处必定传入的是 List[str] 格式，不再报错       
             )
 
             result_text = response.completion_text
@@ -121,7 +124,7 @@ class MemeReaderPro(Star):
             yield event.plain_result(f"解析失败！请确认当前 AstrBot 后台默认的模型支持视觉(看图)能力。详细报错：{str(e)}")
 
         finally:
-            # 清理本地缓存的 GIF 拆解帧文件
+            # 清理本地缓存的 GIF 拆解帧文件，避免占用硬盘空间
             for file_path in temp_files_to_clean:
                 if os.path.exists(file_path):
                     os.remove(file_path)
@@ -164,4 +167,3 @@ class MemeReaderPro(Star):
                 temp_files.append(frame_path)
                 
         return extracted_paths, temp_files
-
