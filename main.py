@@ -2,25 +2,22 @@ import os
 import json
 import uuid
 import tempfile
-import asyncio
 import aiohttp
 from PIL import Image as PILImage, ImageSequence
-from typing import List
 
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
 from astrbot.api.message_components import Image, Plain
 
-@register("meme_reader_pro", "YourName", "支持GIF逐帧拆解与模型切换的表情包解读插件", "2.0.0")
+@register("meme_reader_pro", "YourName", "支持GIF逐帧拆解的梗图解读插件", "2.0.0")
 class MemeReaderPro(Star):
     def __init__(self, context: Context):
         super().__init__(context)
-        # 配置文件路径，用于保存用户设定的模型和帧数
+        # 配置文件路径，现在只负责保存用户设定的帧数
         self.config_path = os.path.join(os.path.dirname(__file__), "meme_config.json")
         self.config = {
-            "provider_id": "default", # 默认使用 AstrBot 当前的默认模型
-            "max_frames": 4           # GIF 默认最大提取帧数
+            "max_frames": 4  # GIF 默认最大提取帧数
         }
         self.load_config()
 
@@ -41,50 +38,24 @@ class MemeReaderPro(Star):
         except Exception as e:
             logger.error(f"保存配置文件失败: {e}")
 
-    # ================= 指令1：模型与参数设置 =================
+    # ================= 指令1：动图提取参数设置 =================
     @filter.command("解读设置")
     async def settings(self, event: AstrMessageEvent, action: str = "", value: str = ""):
         """
-        指令：/解读设置 [操作] [值]
-        操作支持：模型列表, 设置模型, 设置帧数
+        指令：/解读设置 设置帧数 [数字]
         """
-        if action == "模型列表":
-            # 尝试从 AstrBot 上下文中获取已加载的 provider 列表
-            providers = []
-            if hasattr(self.context, 'providers'):
-                providers = list(self.context.providers.keys())
-            
-            if not providers:
-                yield event.plain_result("未能获取到模型列表，可能是框架版本差异。")
-                return
-            
-            msg = "📋 当前 AstrBot 已加载的模型提供商有：\n" + "\n".join([f"- {p}" for p in providers])
-            msg += f"\n\n当前正在使用的是：{self.config['provider_id']} \n(发送 '/解读设置 设置模型 [名称]' 来切换)"
-            yield event.plain_result(msg)
-
-        elif action == "设置模型":
-            if not value:
-                yield event.plain_result("请提供模型名称，例如：/解读设置 设置模型 openai")
-                return
-            self.config["provider_id"] = value
-            self.save_config()
-            yield event.plain_result(f"✅ 解读专用的模型已切换为：{value}")
-
-        elif action == "设置帧数":
+        if action == "设置帧数":
             if not value.isdigit() or int(value) < 1 or int(value) > 10:
                 yield event.plain_result("请提供 1 到 10 之间的数字！过多的帧数会导致大模型报错。")
                 return
             self.config["max_frames"] = int(value)
             self.save_config()
             yield event.plain_result(f"✅ GIF 动图最大解析帧数已设置为：{value} 帧")
-            
         else:
             yield event.plain_result(
                 "⚙️ 【解读插件设置指南】\n"
-                "1. /解读设置 模型列表 (查看可用模型)\n"
-                "2. /解读设置 设置模型 [模型名] (切换解析使用的模型)\n"
-                "3. /解读设置 设置模型 default (恢复默认模型)\n"
-                "4. /解读设置 设置帧数 [数字] (设置GIF提取最大帧数)"
+                "1. /解读设置 设置帧数 [数字] (设置GIF提取最大帧数)\n\n"
+                "💡 提示：如果需要切换解读使用的 AI 模型，请直接使用 AstrBot 原生功能（如在后台切换默认模型）。"
             )
 
     # ================= 指令2：表情包/动图解读 =================
@@ -101,23 +72,17 @@ class MemeReaderPro(Star):
             yield event.plain_result("请在发送指令时，同时附带一张表情包图片或 GIF 动图！")
             return
 
-        yield event.plain_result("🤔 正在端详这张表情包...")
+        yield event.plain_result("🤔 正在端详这张图...")
 
         temp_files_to_clean = []
         try:
-            # 1. 获取选定的 Provider
-            provider_id = self.config.get("provider_id", "default")
-            if provider_id == "default":
-                provider = self.context.get_using_provider()
-            else:
-                # 尝试获取用户指定的 provider
-                provider = self.context.providers.get(provider_id)
-                
+            # 【符合官方文档规范】直接获取系统当前正在使用的提供商
+            provider = self.context.get_using_provider()
             if provider is None:
-                yield event.plain_result(f"❌ 错误：找不到名为 '{provider_id}' 的模型，请使用 '/解读设置 模型列表' 检查。")
+                yield event.plain_result("❌ 错误：AstrBot 当前未配置可用的大模型提供商。")
                 return
 
-            # 2. 判断并处理 GIF 动图
+            # 判断并处理 GIF 动图
             image_urls = []
             is_gif = img_url_or_path.lower().endswith('.gif') or "gif" in img_url_or_path.lower()
             
@@ -128,10 +93,8 @@ class MemeReaderPro(Star):
             else:
                 image_urls = [img_url_or_path]
 
-            # 3. 构建提示词
-            prompt = (
-                "你是一个精通互联网黑话和梗图的冲浪高手。"
-            )
+            # 构建提示词
+            prompt = "你是一个精通互联网黑话和梗图的冲浪高手。"
             if is_gif:
                 prompt += f"用户提供了一个 GIF 动图的 {len(image_urls)} 帧连续截图。请根据这几张图的时间顺序：\n"
             else:
@@ -142,7 +105,7 @@ class MemeReaderPro(Star):
                 "2. 结合画面内容和动作，用幽默、简短的语言解释这个梗图想表达的情绪、潜在的梗或是适用的聊天场景。"
             )
 
-            # 4. 调用视觉大模型
+            # 调用视觉大模型
             response = await provider.text_chat(
                 prompt=prompt,
                 session_id=event.session_id, 
@@ -155,10 +118,10 @@ class MemeReaderPro(Star):
 
         except Exception as e:
             logger.error(f"表情包解析异常: {e}")
-            yield event.plain_result(f"解析失败！请确认当前配置的模型支持视觉(Vision)能力。详细报错：{str(e)}")
+            yield event.plain_result(f"解析失败！请确认当前 AstrBot 后台默认的模型支持视觉(看图)能力。详细报错：{str(e)}")
 
         finally:
-            # 5. 清理本地缓存的 GIF 拆解帧文件
+            # 清理本地缓存的 GIF 拆解帧文件
             for file_path in temp_files_to_clean:
                 if os.path.exists(file_path):
                     os.remove(file_path)
@@ -187,4 +150,18 @@ class MemeReaderPro(Star):
         extracted_paths = []
         with PILImage.open(local_gif_path) as img:
             frames = [frame.copy() for frame in ImageSequence.Iterator(img)]
-  
+            total_frames = len(frames)
+            
+            step = max(1, total_frames // max_frames)
+            
+            for i in range(0, total_frames, step):
+                if len(extracted_paths) >= max_frames:
+                    break
+                frame_img = frames[i].convert("RGB") # 转为RGB，去掉透明通道防报错
+                frame_path = os.path.join(tempfile.gettempdir(), f"{uuid.uuid4().hex}.jpg")
+                frame_img.save(frame_path, "JPEG")
+                extracted_paths.append(frame_path)
+                temp_files.append(frame_path)
+                
+        return extracted_paths, temp_files
+
