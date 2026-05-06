@@ -1,69 +1,190 @@
-from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult
+import os
+import json
+import uuid
+import tempfile
+import asyncio
+import aiohttp
+from PIL import Image as PILImage, ImageSequence
+from typing import List
+
+from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
-from astrbot.api.message_components import Image # 必须引入 Image 组件才能识别图片
+from astrbot.api.message_components import Image, Plain
 
-@register("meme_reader", "YourName", "提取并解读聊天中的表情包梗图", "1.0.0")
-class MemeReader(Star):
+@register("meme_reader_pro", "YourName", "支持GIF逐帧拆解与模型切换的表情包解读插件", "2.0.0")
+class MemeReaderPro(Star):
     def __init__(self, context: Context):
         super().__init__(context)
+        # 配置文件路径，用于保存用户设定的模型和帧数
+        self.config_path = os.path.join(os.path.dirname(__file__), "meme_config.json")
+        self.config = {
+            "provider_id": "default", # 默认使用 AstrBot 当前的默认模型
+            "max_frames": 4           # GIF 默认最大提取帧数
+        }
+        self.load_config()
 
-    async def initialize(self):
-        """可选择实现异步的插件初始化方法，当实例化该插件类之后会自动调用该方法。"""
-        logger.info("表情包解读插件已成功初始化！")
+    def load_config(self):
+        """加载本地配置"""
+        if os.path.exists(self.config_path):
+            try:
+                with open(self.config_path, "r", encoding="utf-8") as f:
+                    self.config.update(json.load(f))
+            except Exception as e:
+                logger.error(f"加载配置文件失败: {e}")
 
-    # 注册指令。发送 `/解读 [图片]` 就会触发这个指令
+    def save_config(self):
+        """保存配置到本地"""
+        try:
+            with open(self.config_path, "w", encoding="utf-8") as f:
+                json.dump(self.config, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.error(f"保存配置文件失败: {e}")
+
+    # ================= 指令1：模型与参数设置 =================
+    @filter.command("解读设置")
+    async def settings(self, event: AstrMessageEvent, action: str = "", value: str = ""):
+        """
+        指令：/解读设置 [操作] [值]
+        操作支持：模型列表, 设置模型, 设置帧数
+        """
+        if action == "模型列表":
+            # 尝试从 AstrBot 上下文中获取已加载的 provider 列表
+            providers = []
+            if hasattr(self.context, 'providers'):
+                providers = list(self.context.providers.keys())
+            
+            if not providers:
+                yield event.plain_result("未能获取到模型列表，可能是框架版本差异。")
+                return
+            
+            msg = "📋 当前 AstrBot 已加载的模型提供商有：\n" + "\n".join([f"- {p}" for p in providers])
+            msg += f"\n\n当前正在使用的是：{self.config['provider_id']} \n(发送 '/解读设置 设置模型 [名称]' 来切换)"
+            yield event.plain_result(msg)
+
+        elif action == "设置模型":
+            if not value:
+                yield event.plain_result("请提供模型名称，例如：/解读设置 设置模型 openai")
+                return
+            self.config["provider_id"] = value
+            self.save_config()
+            yield event.plain_result(f"✅ 解读专用的模型已切换为：{value}")
+
+        elif action == "设置帧数":
+            if not value.isdigit() or int(value) < 1 or int(value) > 10:
+                yield event.plain_result("请提供 1 到 10 之间的数字！过多的帧数会导致大模型报错。")
+                return
+            self.config["max_frames"] = int(value)
+            self.save_config()
+            yield event.plain_result(f"✅ GIF 动图最大解析帧数已设置为：{value} 帧")
+            
+        else:
+            yield event.plain_result(
+                "⚙️ 【解读插件设置指南】\n"
+                "1. /解读设置 模型列表 (查看可用模型)\n"
+                "2. /解读设置 设置模型 [模型名] (切换解析使用的模型)\n"
+                "3. /解读设置 设置模型 default (恢复默认模型)\n"
+                "4. /解读设置 设置帧数 [数字] (设置GIF提取最大帧数)"
+            )
+
+    # ================= 指令2：表情包/动图解读 =================
     @filter.command("解读")
     async def read_meme(self, event: AstrMessageEvent):
-        """发送 /解读 并附带一张图片，插件会调用多模态大模型解释这个表情包""" 
-        
-        img_url = None
-        message_chain = event.get_messages() # 用户所发的消息的消息链
-        
-        # 1. 遍历消息链寻找图片组件
-        for component in message_chain:
+        """发送 /解读 并附带图片/动图"""
+        img_url_or_path = None
+        for component in event.get_messages():
             if isinstance(component, Image):
-                # 获取图片的网络链接或本地路径
-                img_url = component.url or component.file 
+                img_url_or_path = component.url or component.file 
                 break
 
-        # 如果用户没发图片
-        if not img_url:
-            yield event.plain_result("请在发送『/解读』指令时，同时附带一张表情包图片哦！")
+        if not img_url_or_path:
+            yield event.plain_result("请在发送指令时，同时附带一张表情包图片或 GIF 动图！")
             return
 
         yield event.plain_result("🤔 正在端详这张表情包...")
 
+        temp_files_to_clean = []
         try:
-            # 2. 构建提示词
-            system_prompt = (
-                "你是一个精通互联网黑话和梗图的网络冲浪高手。请观察用户提供的这张表情包：\n"
-                "1. 提取出图片上的所有文字内容（如果有的话）。\n"
-                "2. 结合画面内容，用幽默、简短的语言解释这个表情包想表达的情绪、潜在的梗或是适用的聊天场景。"
-            )
-
-            # 3. 获取 AstrBot 默认配置的大模型提供商
-            provider = self.context.get_using_provider()
-            
+            # 1. 获取选定的 Provider
+            provider_id = self.config.get("provider_id", "default")
+            if provider_id == "default":
+                provider = self.context.get_using_provider()
+            else:
+                # 尝试获取用户指定的 provider
+                provider = self.context.providers.get(provider_id)
+                
             if provider is None:
-                yield event.plain_result("错误：没有配置可用的大模型提供商。")
+                yield event.plain_result(f"❌ 错误：找不到名为 '{provider_id}' 的模型，请使用 '/解读设置 模型列表' 检查。")
                 return
 
-            # 4. 调用大模型（请确保后台配置的是支持视觉 Vision 的模型）
+            # 2. 判断并处理 GIF 动图
+            image_urls = []
+            is_gif = img_url_or_path.lower().endswith('.gif') or "gif" in img_url_or_path.lower()
+            
+            if is_gif:
+                yield event.plain_result(f"🎞️ 检测到动图，正在均匀提取 {self.config['max_frames']} 帧关键画面...")
+                frames, temp_files_to_clean = await self.process_gif(img_url_or_path, self.config["max_frames"])
+                image_urls = frames
+            else:
+                image_urls = [img_url_or_path]
+
+            # 3. 构建提示词
+            prompt = (
+                "你是一个精通互联网黑话和梗图的冲浪高手。"
+            )
+            if is_gif:
+                prompt += f"用户提供了一个 GIF 动图的 {len(image_urls)} 帧连续截图。请根据这几张图的时间顺序：\n"
+            else:
+                prompt += "请观察用户提供的这张表情包：\n"
+                
+            prompt += (
+                "1. 提取出画面上的关键文字内容（如果有）。\n"
+                "2. 结合画面内容和动作，用幽默、简短的语言解释这个梗图想表达的情绪、潜在的梗或是适用的聊天场景。"
+            )
+
+            # 4. 调用视觉大模型
             response = await provider.text_chat(
-                prompt=system_prompt,
+                prompt=prompt,
                 session_id=event.session_id, 
-                image_urls=[img_url]         
+                image_urls=image_urls         
             )
 
             result_text = response.completion_text
-            logger.info(f"成功解析表情包，模型返回: {result_text}")
-            yield event.plain_result(f"🔍 【表情包解读报告】\n\n{result_text}")
+            logger.info(f"成功解析，模型返回: {result_text}")
+            yield event.plain_result(f"🔍 【梗图解读报告】\n\n{result_text}")
 
         except Exception as e:
             logger.error(f"表情包解析异常: {e}")
-            yield event.plain_result(f"解析失败了！请检查后台配置的模型是否支持视觉(看图)能力。错误信息：{str(e)}")
+            yield event.plain_result(f"解析失败！请确认当前配置的模型支持视觉(Vision)能力。详细报错：{str(e)}")
 
-    async def terminate(self):
-        """可选择实现异步的插件销毁方法，当插件被卸载/停用时会调用。"""
-        logger.info("表情包解读插件已被卸载或停用。")
+        finally:
+            # 5. 清理本地缓存的 GIF 拆解帧文件
+            for file_path in temp_files_to_clean:
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+
+    # ================= 核心逻辑：GIF 提取帧 =================
+    async def process_gif(self, url_or_path: str, max_frames: int):
+        """
+        下载(如需要)并均匀拆解 GIF
+        返回: (抽取出的帧的本地路径列表, 需要清理的临时文件列表)
+        """
+        temp_files = []
+        local_gif_path = url_or_path
+        
+        # 如果是网络URL，先下载到本地临时文件
+        if url_or_path.startswith("http"):
+            temp_gif = os.path.join(tempfile.gettempdir(), f"{uuid.uuid4().hex}.gif")
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url_or_path) as resp:
+                    if resp.status == 200:
+                        with open(temp_gif, "wb") as f:
+                            f.write(await resp.read())
+                        local_gif_path = temp_gif
+                        temp_files.append(temp_gif)
+
+        # 打开 GIF 并逐帧提取
+        extracted_paths = []
+        with PILImage.open(local_gif_path) as img:
+            frames = [frame.copy() for frame in ImageSequence.Iterator(img)]
+  
